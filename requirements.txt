@@ -1,0 +1,30 @@
+# FastAPI & Server
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6
+
+# LlamaIndex & Vector Store
+llama-index>=0.10.0
+llama-index-vector-stores-chroma>=0.1.0
+chromadb>=0.4.22
+
+# PDF Processing
+pymupdf>=1.23.0
+
+# LLM & Embedding (Alibaba Cloud)
+dashscope>=1.14.0
+
+# Reranking
+cohere>=4.5.0
+
+# Evaluation
+ragas>=0.1.0
+
+# Config & Utils
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+aiofiles>=23.0.0
+
+# Optional: Local mode
+# ollama>=0.1.0
