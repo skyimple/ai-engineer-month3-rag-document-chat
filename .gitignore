@@ -13,3 +13,4 @@ build/
 storage/
 .cohere/
 .llama/
+.claude/
