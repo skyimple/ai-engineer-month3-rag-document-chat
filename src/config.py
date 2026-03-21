@@ -21,6 +21,7 @@ class Config:
     # Ollama Local Mode (for future extension)
     USE_OLLAMA: bool = os.getenv("USE_OLLAMA", "false").lower() == "true"
     OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "qwen3.5-plus:0.8b")
 
     # Storage
     STORAGE_PATH: str = os.getenv("STORAGE_PATH", "./storage")

@@ -6,7 +6,7 @@ from llama_index.core import Document
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.schema import MetadataMode
 from llama_index.core.storage import StorageContext
-from llama_index.core.vector_stores import VectorStore
+from llama_index.core.vector_stores.types import VectorStore
 from llama_index.vector_stores.chroma import ChromaVectorStore
 import chromadb
 
