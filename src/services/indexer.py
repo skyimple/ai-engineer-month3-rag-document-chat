@@ -21,6 +21,7 @@ class Indexer:
         self.collection_name = collection_name
         self._storage_context: Optional[StorageContext] = None
         self._vector_store: Optional[VectorStore] = None
+        self._chroma_client: Optional[chromadb.PersistentClient] = None
         self._index = None
         self._chunk_splitter = SentenceSplitter(
             chunk_size=config.CHUNK_SIZE,
@@ -45,10 +46,10 @@ class Indexer:
         chroma_path.mkdir(parents=True, exist_ok=True)
 
         # Initialize Chroma client with persistence
-        chroma_client = chromadb.PersistentClient(path=str(chroma_path))
+        self._chroma_client = chromadb.PersistentClient(path=str(chroma_path))
 
         # Get or create collection
-        chroma_collection = chroma_client.get_or_create_collection(
+        chroma_collection = self._chroma_client.get_or_create_collection(
             name=self.collection_name,
             metadata={"hnsw:space": "cosine"}
         )
@@ -58,9 +59,17 @@ class Indexer:
             chroma_collection=chroma_collection
         )
 
-        # Create storage context
+        # Create storage context with explicit docstore and index store
+        from llama_index.core.storage.docstore import SimpleDocumentStore
+        from llama_index.core.storage.index_store import SimpleIndexStore
+
+        docstore = SimpleDocumentStore()
+        index_store = SimpleIndexStore()
+
         self._storage_context = StorageContext.from_defaults(
             vector_store=self._vector_store,
+            docstore=docstore,
+            index_store=index_store,
             persist_dir=str(storage_path)
         )
 
@@ -132,24 +141,33 @@ class Indexer:
                 "file_name": file_name
             }
 
-        # Parse into nodes
-        from llama_index.core import load_index_from_storage
-        try:
-            self._index = load_index_from_storage(self._storage_context)
-            # For existing index, we need to insert
-            for doc in documents:
-                self._index.insert(doc)
-        except Exception:
-            # Create new index if doesn't exist
-            from llama_index.core import VectorStoreIndex
-            self._index = VectorStoreIndex.from_documents(
-                documents,
-                storage_context=self._storage_context,
-                show_progress=True
-            )
+        # Create new index - always rebuild to ensure Chroma persistence
+        from llama_index.core import VectorStoreIndex
+        from llama_index.embeddings.dashscope import DashScopeEmbedding
 
-        # Persist
-        self._storage_context.persist(persist_dir=str(self._get_storage_path()))
+        embed_model = DashScopeEmbedding(
+            model_name=config.EMBEDDING_MODEL,
+            api_key=config.DASHSCOPE_API_KEY
+        )
+
+        # Process documents in batches to respect DashScope batch size limit (max 10)
+        batch_size = 10
+        for i in range(0, len(documents), batch_size):
+            batch = documents[i:i + batch_size]
+            if i == 0:
+                # First batch - create new index
+                self._index = VectorStoreIndex.from_documents(
+                    batch,
+                    storage_context=self._storage_context,
+                    embed_model=embed_model,
+                    show_progress=True
+                )
+            else:
+                # Subsequent batches - insert into existing index
+                for doc in batch:
+                    self._index.insert(doc)
+
+        # Chroma PersistentClient auto-persist is enabled, no manual call needed
 
         return {
             "status": "success",
@@ -167,19 +185,25 @@ class Indexer:
         if not documents:
             return {"status": "skipped", "reason": "No documents provided"}
 
+        from llama_index.core import VectorStoreIndex
+        from llama_index.embeddings.dashscope import DashScopeEmbedding
+
+        embed_model = DashScopeEmbedding(
+            model_name=config.EMBEDDING_MODEL,
+            api_key=config.DASHSCOPE_API_KEY
+        )
+
         try:
             self._index = load_index_from_storage(self._storage_context)
             for doc in documents:
                 self._index.insert(doc)
         except Exception:
-            from llama_index.core import VectorStoreIndex
             self._index = VectorStoreIndex.from_documents(
                 documents,
                 storage_context=self._storage_context,
+                embed_model=embed_model,
                 show_progress=True
             )
-
-        self._storage_context.persist(persist_dir=str(self._get_storage_path()))
 
         return {
             "status": "success",
@@ -192,14 +216,22 @@ class Indexer:
             self.initialize_storage()
 
         if self._index is None:
+            from llama_index.core import VectorStoreIndex
+            from llama_index.embeddings.dashscope import DashScopeEmbedding
+
+            embed_model = DashScopeEmbedding(
+                model_name=config.EMBEDDING_MODEL,
+                api_key=config.DASHSCOPE_API_KEY
+            )
+
             try:
                 from llama_index.core import load_index_from_storage
                 self._index = load_index_from_storage(self._storage_context)
             except Exception:
-                from llama_index.core import VectorStoreIndex
                 self._index = VectorStoreIndex.from_documents(
                     [],
                     storage_context=self._storage_context,
+                    embed_model=embed_model,
                 )
 
         return self._index

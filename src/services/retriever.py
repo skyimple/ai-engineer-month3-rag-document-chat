@@ -1,60 +1,73 @@
-from typing import List, Optional, Tuple
+from typing import List, Optional
+import json
 import cohere
-from llama_index.core import QueryBundle
-from llama_index.core.retrievers import VectorIndexRetriever
+import chromadb
 
 from src.config import config
-from src.services.indexer import indexer
 from src.models import Source
 
 
 class Retriever:
-    """Retrieval with optional Cohere reranking"""
+    """Retrieval with ChromaDB direct query and optional Cohere reranking"""
 
     def __init__(self):
+        self._chroma_client = None
+        self._collection = None
+        self._embed_model = None
         self._cohere_client = None
+
         if config.USE_COHERE_RERANK and config.COHERE_API_KEY:
             try:
                 self._cohere_client = cohere.Client(config.COHERE_API_KEY)
             except Exception as e:
                 print(f"Warning: Failed to initialize Cohere client: {e}")
 
-    def _create_retriever(self, top_k: int) -> VectorIndexRetriever:
-        """Create a base vector retriever"""
-        index = indexer.get_index()
+    def _get_collection(self):
+        """Get or create ChromaDB collection"""
+        if self._collection is None:
+            from llama_index.embeddings.dashscope import DashScopeEmbedding
 
-        return VectorIndexRetriever(
-            index=index,
-            similarity_top_k=top_k * 3 if config.USE_COHERE_RERANK else top_k,
-            filters=None,
-        )
+            chroma_path = config.get_storage_path() / "chroma"
+            self._chroma_client = chromadb.PersistentClient(path=str(chroma_path))
+            self._collection = self._chroma_client.get_or_create_collection(
+                name="rag_documents",
+                metadata={"hnsw:space": "cosine"}
+            )
 
-    def _filter_by_file_name(
-        self,
-        nodes: List,
-        file_name: Optional[str] = None
-    ) -> List:
-        """Filter retrieved nodes by file name if specified"""
-        if not file_name:
-            return nodes
+            # Initialize embedding model for query
+            self._embed_model = DashScopeEmbedding(
+                model_name=config.EMBEDDING_MODEL,
+                api_key=config.DASHSCOPE_API_KEY
+            )
 
-        return [
-            node for node in nodes
-            if node.metadata.get("file_name") == file_name
-        ]
+        return self._collection
+
+    def _get_query_embedding(self, query: str) -> List[float]:
+        """Get embedding for query text"""
+        if self._embed_model is None:
+            self._get_collection()
+        return self._embed_model.get_text_embedding(query)
+
+    def _parse_node_content(self, node_content: str) -> str:
+        """Parse node content from JSON string to extract text"""
+        try:
+            node_data = json.loads(node_content)
+            return node_data.get("text", node_content)
+        except (json.JSONDecodeError, TypeError):
+            return node_content
 
     def _rerank_with_cohere(
         self,
         query: str,
-        nodes: List,
+        results: List,
         top_n: int
     ) -> List:
         """Rerank results using Cohere"""
-        if not self._cohere_client or not nodes:
-            return nodes[:top_n]
+        if not self._cohere_client or not results:
+            return results[:top_n]
 
         try:
-            doc_texts = [node.get_content() for node in nodes]
+            doc_texts = [r["document"] for r in results]
 
             response = self._cohere_client.rerank(
                 query=query,
@@ -65,13 +78,13 @@ class Retriever:
 
             reranked = []
             for result in response.results:
-                reranked.append(nodes[result.index])
+                reranked.append(results[result.index])
 
             return reranked
 
         except Exception as e:
             print(f"Cohere reranking failed: {e}")
-            return nodes[:top_n]
+            return results[:top_n]
 
     def retrieve(
         self,
@@ -79,27 +92,88 @@ class Retriever:
         file_name: Optional[str] = None,
         top_k: int = 5
     ) -> List[Source]:
-        """Retrieve relevant sources for a query"""
-        retriever = self._create_retriever(top_k)
-        query_bundle = QueryBundle(query_str=query)
+        """Retrieve relevant sources for a query using ChromaDB directly"""
+        collection = self._get_collection()
 
-        nodes = retriever.retrieve(query_bundle)
-        nodes = self._filter_by_file_name(nodes, file_name)
+        # Get query embedding
+        query_embedding = self._get_query_embedding(query)
 
-        if config.USE_COHERE_RERANK and self._cohere_client:
-            nodes = self._rerank_with_cohere(query, nodes, top_n=top_k)
-        else:
-            nodes = nodes[:top_k]
+        # Calculate how many to retrieve (3x if reranking)
+        retrieve_k = top_k * 3 if config.USE_COHERE_RERANK else top_k
+
+        # Query ChromaDB with pre-computed embedding
+        results = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=retrieve_k,
+            include=["documents", "metadatas", "distances"]
+        )
 
         sources = []
-        for node in nodes:
-            source = Source(
-                content=node.get_content()[:500],
-                file_name=node.metadata.get("file_name", "unknown"),
-                page_label=str(node.metadata.get("page_label", "")),
-                score=float(node.get_score()) if hasattr(node, 'get_score') else 0.0
+        if results and results["ids"]:
+            ids = results["ids"][0]
+            documents = results["documents"][0]
+            metadatas = results["metadatas"][0]
+            distances = results["distances"][0]
+
+            for i, (doc_id, document, metadata, distance) in enumerate(zip(ids, documents, metadatas, distances)):
+                # Filter by file_name if specified
+                if file_name and metadata.get("file_name") != file_name:
+                    continue
+
+                # Parse text from node content or use document directly
+                if metadata.get("_node_content"):
+                    text = self._parse_node_content(metadata["_node_content"])
+                else:
+                    text = document
+
+                # Convert distance to similarity score (cosine distance)
+                score = 1.0 - distance if distance is not None else 0.0
+
+                source = Source(
+                    content=text[:500] if text else document[:500],
+                    file_name=metadata.get("file_name", "unknown"),
+                    page_label=str(metadata.get("page_label", "")),
+                    score=float(score)
+                )
+                sources.append(source)
+
+                # Stop if we have enough
+                if len(sources) >= top_k:
+                    break
+
+        # Apply reranking if enabled
+        if config.USE_COHERE_RERANK and self._cohere_client and sources:
+            # Re-query without file filter for reranking
+            all_results = collection.query(
+                query_embeddings=[query_embedding],
+                n_results=retrieve_k,
+                include=["documents", "metadatas", "distances"]
             )
-            sources.append(source)
+
+            all_sources = []
+            if all_results and all_results["ids"]:
+                for i, (doc_id, document, metadata, distance) in enumerate(zip(
+                    all_results["ids"][0], all_results["documents"][0],
+                    all_results["metadatas"][0], all_results["distances"][0]
+                )):
+                    if file_name and metadata.get("file_name") != file_name:
+                        continue
+
+                    if metadata.get("_node_content"):
+                        text = self._parse_node_content(metadata["_node_content"])
+                    else:
+                        text = document
+
+                    score = 1.0 - distance if distance is not None else 0.0
+
+                    all_sources.append(Source(
+                        content=text[:500] if text else document[:500],
+                        file_name=metadata.get("file_name", "unknown"),
+                        page_label=str(metadata.get("page_label", "")),
+                        score=float(score)
+                    ))
+
+            sources = self._rerank_with_cohere(query, all_sources, top_n=top_k)
 
         return sources
 

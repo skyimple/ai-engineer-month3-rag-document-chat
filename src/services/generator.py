@@ -1,7 +1,6 @@
 import os
+import requests
 from typing import List, Optional, Dict, Any
-import dashscope
-from dashscope import Generation
 
 from src.config import config
 from src.models import Source
@@ -16,6 +15,7 @@ class Generator:
         self.use_ollama = config.USE_OLLAMA
         self.ollama_base_url = config.OLLAMA_BASE_URL
         self.ollama_model = config.OLLAMA_MODEL
+        self.dashscope_base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
     def _build_prompt(self, question: str, sources: List[Source]) -> str:
         """Build prompt with context from retrieved sources"""
@@ -44,20 +44,26 @@ class Generator:
             return "错误：未配置 DASHSCOPE_API_KEY"
 
         try:
-            dashscope.api_key = self.api_key
+            url = f"{self.dashscope_base_url}/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+            data = {
+                "model": self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 1024,
+                "temperature": 0.7,
+                "top_p": 0.8
+            }
 
-            response = Generation.call(
-                model=self.model,
-                prompt=prompt,
-                max_tokens=1024,
-                temperature=0.7,
-                top_p=0.8,
-            )
+            response = requests.post(url, headers=headers, json=data, timeout=120)
+            result = response.json()
 
             if response.status_code == 200:
-                return response.output.get("text", "").strip()
+                return result["choices"][0]["message"]["content"].strip()
             else:
-                return f"生成失败: {response.message}"
+                return f"生成失败: {result.get('error', {}).get('message', 'Unknown error')}"
 
         except Exception as e:
             return f"生成答案时出错: {str(e)}"
@@ -117,7 +123,24 @@ class Generator:
             Generated answer text
         """
         if not sources:
-            return "抱歉，没有找到相关的参考文档来回答您的问题。"
+            # No sources found - use LLM's own knowledge
+            return self._generate_with_dashscope(
+                f"你是一个有用的AI助手。请回答以下问题：\n\n问题：{question}"
+            ) if not self.use_ollama else self._generate_with_ollama(
+                f"你是一个有用的AI助手。请回答以下问题：\n\n问题：{question}"
+            )
+
+        # Check if best source has low relevance (threshold: 0.5 for 1-distance)
+        # If below threshold, use LLM's own knowledge
+        best_score = sources[0].score if sources else 0.0
+        relevance_threshold = 0.5
+
+        if best_score < relevance_threshold:
+            return self._generate_with_dashscope(
+                f"你是一个有用的AI助手。请回答以下问题：\n\n问题：{question}"
+            ) if not self.use_ollama else self._generate_with_ollama(
+                f"你是一个有用的AI助手。请回答以下问题：\n\n问题：{question}"
+            )
 
         prompt = self._build_prompt(question, sources)
 
